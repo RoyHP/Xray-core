@@ -112,10 +112,10 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 	}
 	if t, ok := options.Tun.(segmenter); ok && t.Segments() {
 		s.segmenter = t
-		s.window = tcpLargeWindow
+		s.window = tcpLargeWindow()
 	}
 	if options.Remote {
-		s.window = tcpLargeWindow
+		s.window = tcpLargeWindow()
 	}
 	for i := range s.identification {
 		s.identification[i].Store(rand.Uint32())

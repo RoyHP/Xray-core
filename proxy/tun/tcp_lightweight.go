@@ -25,8 +25,11 @@ const (
 	tcpAck
 )
 
-// tcpLargeWindow is tcpLargeWindowDefault unless the xray.tun.window.large env says otherwise
-var tcpLargeWindow = int32(platform.NewEnvFlag(platform.TunLargeWindowKey).GetValueAsInt(tcpLargeWindowDefault))
+// tcpLargeWindow is tcpLargeWindowDefault unless the xray.tun.window.large env says otherwise. Read when a
+// stack is made, not at init: a config's env is applied by os.Setenv while the config is built
+func tcpLargeWindow() int32 {
+	return int32(platform.NewEnvFlag(platform.TunLargeWindowKey).GetValueAsInt(tcpLargeWindowDefault))
+}
 
 const (
 	// tcpWindow is what a connection takes from the system before its reader has to take it,
