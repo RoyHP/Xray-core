@@ -230,7 +230,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
 
-	if t.tcpSlots != nil && destination.Network == net.Network_TCP {
+	// Port 53 is never capped: DNS over TCP is rare and tiny, and a client's health probe
+	// to its resolver must not queue behind a page's worth of busy flows.
+	if t.tcpSlots != nil && destination.Network == net.Network_TCP && destination.Port != 53 {
 		// Wait for a slot; the system's side is established and its data waits in the stack's window.
 		// A flow that cannot get one in time is reset so the application retries instead of hanging.
 		timer := time.NewTimer(t.flowWait)
