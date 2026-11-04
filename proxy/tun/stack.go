@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 )
 
 // Stack interface implement ip protocol stack, bridging raw network packets and data streams
@@ -62,6 +63,10 @@ type stack struct {
 	segmenter segmenter
 	// window is the window of every connection
 	window int32
+	// refuseIPv6 answers every IPv6 SYN with a reset and drops IPv6 datagrams, for a client whose
+	// upstream has no IPv6: the system then falls back to IPv4 at connect time (Happy Eyeballs)
+	// instead of after an established connection goes nowhere. Set with the xray.tun.ipv6.refuse env.
+	refuseIPv6 bool
 	// verify is set if the checksums of what comes are looked at
 	verify bool
 	// stamps is set if connections carry the times of RFC 7323 when the other side does
@@ -94,15 +99,16 @@ type stack struct {
 // NewStack builds new ip stack. Without a handler it takes no connections, only opens them
 func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandler) (Stack, error) {
 	s := &stack{
-		ctx:       ctx,
-		tun:       options.Tun,
-		mtu:       int(options.MTU),
-		window:    tcpWindow,
-		addresses: options.Addresses,
-		verify:    options.Remote,
-		stamps:    options.Remote,
-		conns:     make(map[flow]*tcpConn),
-		sockets:   make(map[netip.AddrPort]*udpSocket),
+		ctx:        ctx,
+		tun:        options.Tun,
+		mtu:        int(options.MTU),
+		window:     tcpWindow,
+		addresses:  options.Addresses,
+		verify:     options.Remote,
+		stamps:     options.Remote,
+		conns:      make(map[flow]*tcpConn),
+		sockets:    make(map[netip.AddrPort]*udpSocket),
+		refuseIPv6: platform.NewEnvFlag(platform.TunRefuseIPv6Key).GetValue(func() string { return "" }) == "1",
 	}
 	if t, ok := options.Tun.(segmenter); ok && t.Segments() {
 		s.segmenter = t
@@ -318,6 +324,12 @@ func (s *stack) handleTCP(p packet) {
 		payload: t[size:],
 		rest:    p.rest,
 	}
+	if s.refuseIPv6 && p.dst.Is6() {
+		if seg.flags&tcpRst == 0 {
+			s.refuse(f, seg)
+		}
+		return
+	}
 
 	s.mu.Lock()
 	c := s.conns[f]
@@ -394,6 +406,9 @@ func (s *stack) handleUDP(p packet) {
 	}
 	size := int(binary.BigEndian.Uint16(u[4:]))
 	if size < udpHeaderSize || size > len(u) {
+		return
+	}
+	if s.refuseIPv6 && p.dst.Is6() {
 		return
 	}
 	var socket *udpSocket

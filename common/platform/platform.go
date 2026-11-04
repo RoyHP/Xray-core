@@ -25,6 +25,13 @@ const (
 	XUDPBaseKey          = "xray.xudp.basekey"
 
 	TunFdKey = "xray.tun.fd"
+	// TunRefuseIPv6Key, when "1", makes the tun stack reset IPv6 TCP and drop IPv6 UDP instead of
+	// accepting them for an upstream that cannot carry them (mobile clients of IPv4-only nodes).
+	TunRefuseIPv6Key = "xray.tun.ipv6.refuse"
+	// TunLargeWindowKey overrides the receive window (bytes) of the stack behind a tunnel tun
+	// (the wireguard outbound's). The default 1 MiB per connection is too much for a 50 MiB
+	// iOS packet tunnel under parallel downloads.
+	TunLargeWindowKey = "xray.tun.window.large"
 )
 
 type EnvFlag struct {

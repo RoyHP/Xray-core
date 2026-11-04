@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 )
 
 const (
@@ -24,14 +25,18 @@ const (
 	tcpAck
 )
 
+// tcpLargeWindow is tcpLargeWindowDefault unless the xray.tun.window.large env says otherwise
+var tcpLargeWindow = int32(platform.NewEnvFlag(platform.TunLargeWindowKey).GetValueAsInt(tcpLargeWindowDefault))
+
 const (
 	// tcpWindow is what a connection takes from the system before its reader has to take it,
 	// and the most that it sends to the system before that is acknowledged. More than that, for several
 	// connections at once, is more packets than the queue of a tun holds (500 on Linux)
 	tcpWindow = 256 << 10
-	// tcpLargeWindow is the same for a tun that takes and gives segments that are larger than its MTU: those are
-	// few, and a way with a longer round trip, as a router has to what is behind it, is not held back by it
-	tcpLargeWindow = 1 << 20
+	// tcpLargeWindowDefault is the same for a tun that takes and gives segments that are larger than its MTU: those
+	// are few, and a way with a longer round trip, as a router has to what is behind it, is not held back by it.
+	// See tcpLargeWindow for the override.
+	tcpLargeWindowDefault = 1 << 20
 	// tcpWindowShift makes them fit the 16 bits of a window
 	tcpWindowShift = 5
 	// tcpHeld is how many segments wait for one that was lost before them,
