@@ -1253,6 +1253,26 @@ func (c *tcpConn) Close() error {
 	return nil
 }
 
+// CloseWrite sends the FIN of this side and keeps reading: what the other side of the proxied connection
+// had to say is over, the system learns it at once and closes in turn instead of waiting for its own timeout.
+// The connection ends when both sides have closed (see input), which ends the dispatch that holds it.
+func (c *tcpConn) CloseWrite() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.sndFin || c.err != nil {
+		return nil
+	}
+	if c.writing != 0 {
+		// a write is in flight without mu; its end comes before the FIN could
+		return nil
+	}
+	c.send(c.sndNxt, tcpFin|tcpAck, nil, nil)
+	c.sndFin = true
+	c.sndNxt++
+	c.arm(tcpTick)
+	return nil
+}
+
 func (c *tcpConn) LocalAddr() net.Addr {
 	return c.dst.RawNetAddr()
 }

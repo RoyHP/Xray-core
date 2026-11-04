@@ -61,12 +61,24 @@ func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
-// TCPWriter is the writing side of a TCP connection of the stack for the dispatcher. It has no Close: the outbound
-// closes its writer when the other side has no more to send, and the system may still be sending
+// TCPWriter is the writing side of a TCP connection of the stack for the dispatcher. The outbound closes its
+// writer when the other side has no more to send; that is passed on to the system as a half-close (FIN), so
+// a flow whose far end is gone ends as soon as the system closes in turn rather than at its idle timeout,
+// while the system may still be sending
 type TCPWriter struct {
 	Writer buf.Writer
 	// Counter counts what is written, if there is one
 	Counter stats.Counter
+	// Conn is the connection behind Writer, for the half-close
+	Conn net.Conn
+}
+
+// Close implements common.Closable: a half-close of the system's side
+func (w *TCPWriter) Close() error {
+	if hc, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return hc.CloseWrite()
+	}
+	return nil
 }
 
 func (w *TCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -277,7 +289,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn), Counter: t.uplinkCounter}
 	writer := buf.NewWriter(conn)
 	if destination.Network != net.Network_UDP {
-		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter}
+		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter, Conn: conn}
 	} else if t.downlinkCounter != nil {
 		writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
 	}
