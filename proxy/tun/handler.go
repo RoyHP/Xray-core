@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -12,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -25,8 +27,11 @@ import (
 
 // Handler is managing object that tie together tun interface, ip stack and dispatch connections to the routing
 type Handler struct {
-	ctx             context.Context
-	config          *Config
+	ctx    context.Context
+	config *Config
+	// tcpSlots bounds concurrently dispatched TCP flows when xray.tun.tcp.maxflows is set
+	tcpSlots        chan struct{}
+	flowWait        time.Duration
 	stack           Stack
 	tun             Tun
 	policyManager   policy.Manager
@@ -99,6 +104,10 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	t.ctx = core.ToBackgroundDetachedContext(ctx)
 	t.policyManager = pm
 	t.dispatcher = dispatcher
+	if n := platform.NewEnvFlag(platform.TunMaxTCPFlowsKey).GetValueAsInt(0); n > 0 {
+		t.tcpSlots = make(chan struct{}, n)
+		t.flowWait = time.Duration(platform.NewEnvFlag(platform.TunFlowWaitKey).GetValueAsInt(15)) * time.Second
+	}
 
 	if len(t.tag) > 0 && pm.ForSystem().Stats.InboundUplink {
 		statsManager := core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager)
@@ -220,6 +229,23 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	ctx = c.ContextWithID(ctx, session.NewID())
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
+
+	if t.tcpSlots != nil && destination.Network == net.Network_TCP {
+		// Wait for a slot; the system's side is established and its data waits in the stack's window.
+		// A flow that cannot get one in time is reset so the application retries instead of hanging.
+		timer := time.NewTimer(t.flowWait)
+		select {
+		case t.tcpSlots <- struct{}{}:
+			timer.Stop()
+		case <-timer.C:
+			errors.LogInfo(ctx, "no flow slot for ", destination, " within ", t.flowWait)
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
+		defer func() { <-t.tcpSlots }()
+	}
 
 	inbound := session.Inbound{
 		Name:          "tun",
