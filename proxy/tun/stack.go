@@ -102,7 +102,7 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 		ctx:        ctx,
 		tun:        options.Tun,
 		mtu:        int(options.MTU),
-		window:     tcpWindow,
+		window:     tcpWindow(),
 		addresses:  options.Addresses,
 		verify:     options.Remote,
 		stamps:     options.Remote,

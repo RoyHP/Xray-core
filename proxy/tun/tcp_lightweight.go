@@ -25,17 +25,22 @@ const (
 	tcpAck
 )
 
-// tcpLargeWindow is tcpLargeWindowDefault unless the xray.tun.window.large env says otherwise. Read when a
-// stack is made, not at init: a config's env is applied by os.Setenv while the config is built
+// tcpWindow() is tcpWindowDefault unless the xray.tun.window env says otherwise. Read when a stack is made,
+// not at init: a config's env is applied by os.Setenv while the config is built
+func tcpWindow() int32 {
+	return int32(platform.NewEnvFlag(platform.TunWindowKey).GetValueAsInt(tcpWindowDefault))
+}
+
+// tcpLargeWindow is tcpLargeWindowDefault unless the xray.tun.window.large env says otherwise
 func tcpLargeWindow() int32 {
 	return int32(platform.NewEnvFlag(platform.TunLargeWindowKey).GetValueAsInt(tcpLargeWindowDefault))
 }
 
 const (
-	// tcpWindow is what a connection takes from the system before its reader has to take it,
+	// tcpWindowDefault is what a connection takes from the system before its reader has to take it,
 	// and the most that it sends to the system before that is acknowledged. More than that, for several
-	// connections at once, is more packets than the queue of a tun holds (500 on Linux)
-	tcpWindow = 256 << 10
+	// connections at once, is more packets than the queue of a tun holds (500 on Linux). See tcpWindow()
+	tcpWindowDefault = 256 << 10
 	// tcpLargeWindowDefault is the same for a tun that takes and gives segments that are larger than its MTU: those
 	// are few, and a way with a longer round trip, as a router has to what is behind it, is not held back by it.
 	// See tcpLargeWindow for the override.
@@ -136,7 +141,7 @@ type tcpConn struct {
 	ipSize int
 	// mss is the largest payload of a segment that is sent
 	mss int
-	// window is tcpWindow or tcpLargeWindow
+	// window is tcpWindow() or tcpLargeWindow
 	window int32
 	// sndShift and rcvShift are the window scale of what the system and we advertise
 	sndShift, rcvShift uint8

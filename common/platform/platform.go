@@ -28,6 +28,11 @@ const (
 	// TunRefuseIPv6Key, when "1", makes the tun stack reset IPv6 TCP and drop IPv6 UDP instead of
 	// accepting them for an upstream that cannot carry them (mobile clients of IPv4-only nodes).
 	TunRefuseIPv6Key = "xray.tun.ipv6.refuse"
+	// TunWindowKey overrides the per-connection window (bytes) of the stack on a plain tun: what it buffers
+	// unread from the system and unacknowledged to it. The system is a hop away, so a small window costs
+	// nothing in throughput; the default 256 KiB times a page's hundred connections is more than an iOS
+	// packet tunnel may hold.
+	TunWindowKey = "xray.tun.window"
 	// TunLargeWindowKey overrides the receive window (bytes) of the stack behind a tunnel tun
 	// (the wireguard outbound's). The default 1 MiB per connection is too much for a 50 MiB
 	// iOS packet tunnel under parallel downloads.

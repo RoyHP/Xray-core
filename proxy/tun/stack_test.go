@@ -107,7 +107,7 @@ func (l *link) WriteSegment(header []byte, payload [][]byte, mss int) error {
 }
 
 func newTestStack(t *testing.T, l *link, handle func(net.Conn, net.Destination)) *stack {
-	s := &stack{ctx: context.Background(), tun: l, mtu: testMTU, window: tcpWindow, handle: handle, conns: make(map[flow]*tcpConn), sockets: make(map[netip.AddrPort]*udpSocket)}
+	s := &stack{ctx: context.Background(), tun: l, mtu: testMTU, window: tcpWindow(), handle: handle, conns: make(map[flow]*tcpConn), sockets: make(map[netip.AddrPort]*udpSocket)}
 	if l.segments {
 		s.segmenter, s.window, l.wrong = l, tcpLargeWindow(), t.Error
 	}
@@ -1062,7 +1062,7 @@ func TestTCPReset(t *testing.T) {
 	p.connect(nil)
 	a := take(t, conns)
 	// a reset from somewhere else than where the connection is changes nothing
-	p.send(p.seq+tcpWindow+1, tcpRst, nil, nil)
+	p.send(p.seq+uint32(tcpWindow())+1, tcpRst, nil, nil)
 	p.send(p.seq-1, tcpRst, nil, nil)
 	p.send(p.seq, tcpAck|tcpPsh, nil, []byte("abc"))
 	p.seq += 3
@@ -1268,7 +1268,7 @@ func TestTCPDial(t *testing.T) {
 		expected, options []byte
 		window            uint16
 	}{
-		{"10.0.0.1:80", "10.0.0.2", []byte{2, 4, 5, 0xb4, 1, 1, 4, 2, 1, 3, 3, tcpWindowShift}, []byte{2, 4, 2, 0, 4, 2, 1, 3, 3, 7, 0, 0}, tcpWindow >> tcpWindowShift},
+		{"10.0.0.1:80", "10.0.0.2", []byte{2, 4, 5, 0xb4, 1, 1, 4, 2, 1, 3, 3, tcpWindowShift}, []byte{2, 4, 2, 0, 4, 2, 1, 3, 3, 7, 0, 0}, uint16(tcpWindow() >> tcpWindowShift)},
 		{"[fd00::1]:80", "fd00::2", []byte{2, 4, 5, 0xa0, 1, 1, 4, 2, 1, 3, 3, tcpWindowShift}, nil, 0xffff},
 	} {
 		p, l := newPeer(t, test.remote, "10.0.0.2:0")
@@ -2178,7 +2178,7 @@ func (h handler) HandleConnection(conn net.Conn, dest net.Destination) { h(conn,
 func TestNewStack(t *testing.T) {
 	l := newLink()
 	made, _ := NewStack(context.Background(), StackOptions{Tun: l, MTU: testMTU}, nil)
-	if s := made.(*stack); s.mtu != testMTU || s.window != tcpWindow || s.verify || s.stamps || s.segmenter != nil || s.handle != nil || s.udp != nil {
+	if s := made.(*stack); s.mtu != testMTU || s.window != tcpWindow() || s.verify || s.stamps || s.segmenter != nil || s.handle != nil || s.udp != nil {
 		t.Fatal("wrong stack for a tun of this machine that only opens connections: ", s)
 	}
 	l.segments = true
