@@ -109,7 +109,7 @@ func (l *link) WriteSegment(header []byte, payload [][]byte, mss int) error {
 func newTestStack(t *testing.T, l *link, handle func(net.Conn, net.Destination)) *stack {
 	s := &stack{ctx: context.Background(), tun: l, mtu: testMTU, window: tcpWindow, handle: handle, conns: make(map[flow]*tcpConn), sockets: make(map[netip.AddrPort]*udpSocket)}
 	if l.segments {
-		s.segmenter, s.window, l.wrong = l, tcpLargeWindow, t.Error
+		s.segmenter, s.window, l.wrong = l, tcpLargeWindow(), t.Error
 	}
 	if handle != nil {
 		s.udp = newUdpConnectionHandler(handle, s.writeUDP)
@@ -2183,13 +2183,13 @@ func TestNewStack(t *testing.T) {
 	}
 	l.segments = true
 	made, _ = NewStack(context.Background(), StackOptions{Tun: l, MTU: testMTU}, handler(echo))
-	if s := made.(*stack); s.window != tcpLargeWindow || s.verify || s.stamps || s.segmenter == nil || s.handle == nil || s.udp == nil {
+	if s := made.(*stack); s.window != tcpLargeWindow() || s.verify || s.stamps || s.segmenter == nil || s.handle == nil || s.udp == nil {
 		t.Fatal("wrong stack for a tun that takes large segments: ", s)
 	}
 	l.segments = false
 	addresses := []netip.Addr{netip.MustParseAddr("10.0.0.2")}
 	made, _ = NewStack(context.Background(), StackOptions{Tun: l, MTU: testMTU, Addresses: addresses, Remote: true}, nil)
-	if s := made.(*stack); s.window != tcpLargeWindow || !s.verify || !s.stamps || s.segmenter != nil || len(s.addresses) != 1 {
+	if s := made.(*stack); s.window != tcpLargeWindow() || !s.verify || !s.stamps || s.segmenter != nil || len(s.addresses) != 1 {
 		t.Fatal("wrong stack for a tunnel to another system: ", s)
 	}
 }
