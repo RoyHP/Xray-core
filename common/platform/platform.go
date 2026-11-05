@@ -34,6 +34,11 @@ const (
 	// (50 MiB) cannot afford a hundred of. Port 53 is exempt (health probes to the resolver).
 	TunMaxTCPFlowsKey = "xray.tun.tcp.maxflows"
 	TunFlowWaitKey    = "xray.tun.tcp.flowwait"
+	// TunIdleEvictKey: when every slot of the cap is taken, the dispatched flow that has carried nothing
+	// for at least this many seconds (default 5) is closed to make room, longest idle first, before a new
+	// flow is made to wait. The slots would otherwise fill with the keep-alive connections a page leaves
+	// behind, which servers keep for minutes, and every new flow of the device would wait and be reset.
+	TunIdleEvictKey = "xray.tun.tcp.idleevict"
 	// TunWindowKey overrides the per-connection window (bytes) of the stack on a plain tun: what it buffers
 	// unread from the system and unacknowledged to it. The system is a hop away, so a small window costs
 	// nothing in throughput; the default 256 KiB times a page's hundred connections is more than an iOS

@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,8 +32,13 @@ type Handler struct {
 	ctx    context.Context
 	config *Config
 	// tcpSlots bounds concurrently dispatched TCP flows when xray.tun.tcp.maxflows is set
-	tcpSlots        chan struct{}
-	flowWait        time.Duration
+	tcpSlots chan struct{}
+	flowWait time.Duration
+	// idleEvict is how long a dispatched flow must have carried nothing to be closed for a slot
+	idleEvict time.Duration
+	// flows are the dispatched TCP flows of the cap
+	flowsMu         sync.Mutex
+	flows           map[*tcpFlow]struct{}
 	stack           Stack
 	tun             Tun
 	policyManager   policy.Manager
@@ -61,6 +68,35 @@ func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
+// tcpFlow is a dispatched TCP flow of the cap: its connection, to close it for its slot, and when it last
+// carried a byte either way
+type tcpFlow struct {
+	conn net.Conn
+	dest net.Destination
+	// last is the time of the last byte, in nanoseconds since the Unix epoch
+	last atomic.Int64
+	// closing is set once the flow is closed for its slot, so it is not chosen again
+	closing atomic.Bool
+}
+
+func (f *tcpFlow) touch() {
+	f.last.Store(time.Now().UnixNano())
+}
+
+// activityReader stamps the flow when the system sends
+type activityReader struct {
+	buf.Reader
+	flow *tcpFlow
+}
+
+func (r *activityReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if !mb.IsEmpty() {
+		r.flow.touch()
+	}
+	return mb, err
+}
+
 // TCPWriter is the writing side of a TCP connection of the stack for the dispatcher. The outbound closes its
 // writer when the other side has no more to send; that is passed on to the system as a half-close (FIN), so
 // a flow whose far end is gone ends as soon as the system closes in turn rather than at its idle timeout,
@@ -71,6 +107,8 @@ type TCPWriter struct {
 	Counter stats.Counter
 	// Conn is the connection behind Writer, for the half-close
 	Conn net.Conn
+	// Flow is stamped with what is written, if the flow is one of the cap
+	Flow *tcpFlow
 }
 
 // Close implements common.Closable: a half-close of the system's side
@@ -88,6 +126,9 @@ func (w *TCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	if w.Counter != nil {
 		w.Counter.Add(int64(size))
+	}
+	if w.Flow != nil && size > 0 {
+		w.Flow.touch()
 	}
 	return nil
 }
@@ -119,6 +160,8 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	if n := platform.NewEnvFlag(platform.TunMaxTCPFlowsKey).GetValueAsInt(0); n > 0 {
 		t.tcpSlots = make(chan struct{}, n)
 		t.flowWait = time.Duration(platform.NewEnvFlag(platform.TunFlowWaitKey).GetValueAsInt(15)) * time.Second
+		t.idleEvict = time.Duration(platform.NewEnvFlag(platform.TunIdleEvictKey).GetValueAsInt(5)) * time.Second
+		t.flows = make(map[*tcpFlow]struct{})
 	}
 
 	if len(t.tag) > 0 && pm.ForSystem().Stats.InboundUplink {
@@ -244,21 +287,22 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 	// Port 53 is never capped: DNS over TCP is rare and tiny, and a client's health probe
 	// to its resolver must not queue behind a page's worth of busy flows.
+	var flow *tcpFlow
 	if t.tcpSlots != nil && destination.Network == net.Network_TCP && destination.Port != 53 {
-		// Wait for a slot; the system's side is established and its data waits in the stack's window.
-		// A flow that cannot get one in time is reset so the application retries instead of hanging.
-		timer := time.NewTimer(t.flowWait)
-		select {
-		case t.tcpSlots <- struct{}{}:
-			timer.Stop()
-		case <-timer.C:
-			errors.LogInfo(ctx, "no flow slot for ", destination, " within ", t.flowWait)
-			return
-		case <-ctx.Done():
-			timer.Stop()
+		if !t.acquireSlot(ctx, destination) {
 			return
 		}
 		defer func() { <-t.tcpSlots }()
+		flow = &tcpFlow{conn: conn, dest: destination}
+		flow.touch()
+		t.flowsMu.Lock()
+		t.flows[flow] = struct{}{}
+		t.flowsMu.Unlock()
+		defer func() {
+			t.flowsMu.Lock()
+			delete(t.flows, flow)
+			t.flowsMu.Unlock()
+		}()
 	}
 
 	inbound := session.Inbound{
@@ -286,10 +330,14 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
 
 	// both kinds of connection are buf.Reader and buf.Writer, what they carry is counted on the way
-	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn), Counter: t.uplinkCounter}
+	var inner buf.Reader = buf.NewReader(conn)
+	if flow != nil {
+		inner = &activityReader{Reader: inner, flow: flow}
+	}
+	reader := &buf.TimeoutWrapperReader{Reader: inner, Counter: t.uplinkCounter}
 	writer := buf.NewWriter(conn)
 	if destination.Network != net.Network_UDP {
-		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter, Conn: conn}
+		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter, Conn: conn, Flow: flow}
 	} else if t.downlinkCounter != nil {
 		writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
 	}
@@ -301,6 +349,75 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))
 	}
+}
+
+// acquireSlot takes a slot of the cap for a new flow. The system's side is established and its data waits
+// in the stack's window meanwhile. When no slot is free, the dispatched flow that has carried nothing for
+// the longest is closed for its slot, if that is idleEvict or more: a keep-alive the application holds for
+// later, which it opens again when it needs it, while a page's worth of them would otherwise sit in every
+// slot for as long as the servers keep them. A flow that still gets no slot within flowWait is reset so the
+// application retries instead of hanging.
+func (t *Handler) acquireSlot(ctx context.Context, destination net.Destination) bool {
+	select {
+	case t.tcpSlots <- struct{}{}:
+		return true
+	default:
+	}
+	deadline := time.Now().Add(t.flowWait)
+	evicted := 0
+	for {
+		if t.evictIdle(ctx) {
+			evicted++
+		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			break
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case t.tcpSlots <- struct{}{}:
+			timer.Stop()
+			return true
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		}
+	}
+	errors.LogWarning(ctx, "no flow slot for ", destination, " within ", t.flowWait, ", ", evicted, " idle closed")
+	return false
+}
+
+// evictIdle closes the dispatched flow that has carried nothing for the longest, if that is idleEvict or
+// more, and says whether it did. Its slot frees when its dispatch ends on the closed connection.
+func (t *Handler) evictIdle(ctx context.Context) bool {
+	if t.idleEvict <= 0 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	var oldest *tcpFlow
+	var oldestLast int64
+	t.flowsMu.Lock()
+	for f := range t.flows {
+		if f.closing.Load() {
+			continue
+		}
+		if last := f.last.Load(); oldest == nil || last < oldestLast {
+			oldest, oldestLast = f, last
+		}
+	}
+	if oldest == nil || now-oldestLast < int64(t.idleEvict) {
+		t.flowsMu.Unlock()
+		return false
+	}
+	oldest.closing.Store(true)
+	t.flowsMu.Unlock()
+	errors.LogWarning(ctx, "closing the flow to ", oldest.dest, " idle for ", time.Duration(now-oldestLast).Round(time.Second), " for a slot")
+	_ = oldest.conn.Close()
+	return true
 }
 
 // Close implements common.Closable.

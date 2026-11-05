@@ -3,7 +3,9 @@ package tun
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -178,4 +180,102 @@ func TestHandlerCountsTunConnectionTraffic(t *testing.T) {
 	if got := conn.writer.String(); got != "downlink" {
 		t.Fatalf("connection write mismatch: got %q, want %q", got, "downlink")
 	}
+}
+
+// blockingConn is a connection the system keeps open and silent, as a keep-alive is, until it is closed
+type blockingConn struct {
+	*testConn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingConn() *blockingConn {
+	return &blockingConn{testConn: newTestConn(nil), closed: make(chan struct{})}
+}
+
+func (c *blockingConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *blockingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestHandlerClosesTheLongestIdleFlowForASlot(t *testing.T) {
+	h := &Handler{
+		ctx:        context.Background(),
+		config:     &Config{},
+		tcpSlots:   make(chan struct{}, 1),
+		flowWait:   3 * time.Second,
+		idleEvict:  20 * time.Millisecond,
+		flows:      map[*tcpFlow]struct{}{},
+		dispatcher: &testDispatcher{writePayload: []byte("reply")},
+	}
+	dest := xnet.TCPDestination(xnet.IPAddress([]byte{93, 184, 216, 34}), 443)
+
+	idle := newBlockingConn()
+	done := make(chan struct{})
+	go func() {
+		h.HandleConnection(idle, dest)
+		close(done)
+	}()
+	for i := 0; i < 200; i++ {
+		h.flowsMu.Lock()
+		n := len(h.flows)
+		h.flowsMu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	started := time.Now()
+	h.HandleConnection(newTestConn([]byte("hello")), dest)
+	if took := time.Since(started); took >= h.flowWait {
+		t.Fatalf("the new flow waited the whole flowWait (%v) instead of taking the idle flow's slot", took)
+	}
+	select {
+	case <-idle.closed:
+	default:
+		t.Fatal("the idle flow was not closed for its slot")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the idle flow's dispatch did not end after it was closed")
+	}
+	if len(h.tcpSlots) != 0 {
+		t.Fatalf("%d slot(s) still taken after both flows ended", len(h.tcpSlots))
+	}
+}
+
+func TestHandlerKeepsBusyFlowsAndResetsTheNewOne(t *testing.T) {
+	h := &Handler{
+		ctx:        context.Background(),
+		config:     &Config{},
+		tcpSlots:   make(chan struct{}, 1),
+		flowWait:   150 * time.Millisecond,
+		idleEvict:  time.Hour,
+		flows:      map[*tcpFlow]struct{}{},
+		dispatcher: &testDispatcher{writePayload: []byte("reply")},
+	}
+	dest := xnet.TCPDestination(xnet.IPAddress([]byte{93, 184, 216, 34}), 443)
+	busy := newBlockingConn()
+	go h.HandleConnection(busy, dest)
+	time.Sleep(30 * time.Millisecond)
+
+	started := time.Now()
+	h.HandleConnection(newTestConn([]byte("hello")), dest)
+	if took := time.Since(started); took < h.flowWait {
+		t.Fatalf("the new flow got a slot after %v although the only flow was not idle enough", took)
+	}
+	select {
+	case <-busy.closed:
+		t.Fatal("a flow below the idle threshold was closed")
+	default:
+	}
+	busy.Close()
 }
