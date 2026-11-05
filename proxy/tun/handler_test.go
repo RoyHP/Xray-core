@@ -203,79 +203,169 @@ func (c *blockingConn) Close() error {
 	return nil
 }
 
-func TestHandlerClosesTheLongestIdleFlowForASlot(t *testing.T) {
-	h := &Handler{
+func (c *blockingConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// keepAliveDispatcher does what an outbound does with a keep-alive: the answer is written, then it reads
+// until the connection is closed, and its dispatch ends a moment after that (the downlink grace), as the
+// real one does. With answer false it reads first and never answers: a request waiting for its answer
+type keepAliveDispatcher struct {
+	testDispatcher
+	answer bool
+	lag    time.Duration
+}
+
+func (d *keepAliveDispatcher) DispatchLink(_ context.Context, _ xnet.Destination, link *transport.Link) error {
+	if d.answer {
+		if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("answer"))}); err != nil {
+			return err
+		}
+	}
+	_, err := link.Reader.ReadMultiBuffer()
+	time.Sleep(d.lag)
+	return err
+}
+
+func newCapHandler(slots int, flowWait, idleEvict time.Duration, d routing.Dispatcher) *Handler {
+	return &Handler{
 		ctx:        context.Background(),
 		config:     &Config{},
-		tcpSlots:   make(chan struct{}, 1),
-		flowWait:   3 * time.Second,
-		idleEvict:  20 * time.Millisecond,
+		tcpSlots:   make(chan struct{}, slots),
+		flowWait:   flowWait,
+		idleEvict:  idleEvict,
 		flows:      map[*tcpFlow]struct{}{},
-		dispatcher: &testDispatcher{writePayload: []byte("reply")},
+		dispatcher: d,
 	}
-	dest := xnet.TCPDestination(xnet.IPAddress([]byte{93, 184, 216, 34}), 443)
+}
 
-	idle := newBlockingConn()
-	done := make(chan struct{})
-	go func() {
-		h.HandleConnection(idle, dest)
-		close(done)
-	}()
-	for i := 0; i < 200; i++ {
+func waitForFlows(h *Handler, n int) {
+	for i := 0; i < 400; i++ {
 		h.flowsMu.Lock()
-		n := len(h.flows)
+		got := len(h.flows)
 		h.flowsMu.Unlock()
-		if n == 1 {
-			break
+		if got == n {
+			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+var capDest = xnet.TCPDestination(xnet.IPAddress([]byte{93, 184, 216, 34}), 443)
+
+func TestHandlerClosesTheLongestIdleKeepAliveForASlot(t *testing.T) {
+	h := newCapHandler(1, 3*time.Second, 20*time.Millisecond, &keepAliveDispatcher{answer: true})
+	idle := newBlockingConn()
+	done := make(chan struct{})
+	go func() {
+		h.HandleConnection(idle, capDest)
+		close(done)
+	}()
+	waitForFlows(h, 1)
 	time.Sleep(30 * time.Millisecond)
 
 	started := time.Now()
-	h.HandleConnection(newTestConn([]byte("hello")), dest)
+	h.HandleConnection(newBlockingConnClosingItself(), capDest)
 	if took := time.Since(started); took >= h.flowWait {
-		t.Fatalf("the new flow waited the whole flowWait (%v) instead of taking the idle flow's slot", took)
+		t.Fatalf("the new flow waited the whole flowWait (%v) instead of taking the keep-alive's slot", took)
 	}
-	select {
-	case <-idle.closed:
-	default:
-		t.Fatal("the idle flow was not closed for its slot")
+	if !idle.isClosed() {
+		t.Fatal("the keep-alive was not closed for its slot")
 	}
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("the idle flow's dispatch did not end after it was closed")
+		t.Fatal("the keep-alive's dispatch did not end after it was closed")
 	}
 	if len(h.tcpSlots) != 0 {
 		t.Fatalf("%d slot(s) still taken after both flows ended", len(h.tcpSlots))
 	}
 }
 
-func TestHandlerKeepsBusyFlowsAndResetsTheNewOne(t *testing.T) {
-	h := &Handler{
-		ctx:        context.Background(),
-		config:     &Config{},
-		tcpSlots:   make(chan struct{}, 1),
-		flowWait:   150 * time.Millisecond,
-		idleEvict:  time.Hour,
-		flows:      map[*tcpFlow]struct{}{},
-		dispatcher: &testDispatcher{writePayload: []byte("reply")},
+// newBlockingConnClosingItself is a flow that ends by itself once dispatched: its answer is written, then
+// the dispatcher's read ends because the connection closes itself
+type selfClosingConn struct {
+	*blockingConn
+}
+
+func newBlockingConnClosingItself() *selfClosingConn {
+	c := &selfClosingConn{newBlockingConn()}
+	return c
+}
+
+func (c *selfClosingConn) Read(p []byte) (int, error) {
+	c.Close()
+	return 0, io.EOF
+}
+
+func TestHandlerClosesOneKeepAlivePerWaiter(t *testing.T) {
+	// two keep-alives in the two slots, their dispatch ending 1.2 s after they are closed, as the real
+	// outbound's does; one waiter must close exactly one of them, not one per tick while it waits
+	h := newCapHandler(2, 3*time.Second, 20*time.Millisecond, &keepAliveDispatcher{answer: true, lag: 1200 * time.Millisecond})
+	first, second := newBlockingConn(), newBlockingConn()
+	go h.HandleConnection(first, capDest)
+	go h.HandleConnection(second, capDest)
+	waitForFlows(h, 2)
+	time.Sleep(30 * time.Millisecond)
+
+	h.HandleConnection(newBlockingConnClosingItself(), capDest)
+	closed := 0
+	for _, c := range []*blockingConn{first, second} {
+		if c.isClosed() {
+			closed++
+		}
 	}
-	dest := xnet.TCPDestination(xnet.IPAddress([]byte{93, 184, 216, 34}), 443)
-	busy := newBlockingConn()
-	go h.HandleConnection(busy, dest)
+	if closed != 1 {
+		t.Fatalf("%d keep-alives closed for one waiter, want 1", closed)
+	}
+	first.Close()
+	second.Close()
+}
+
+func TestHandlerKeepsAFlowWaitingForItsAnswer(t *testing.T) {
+	// the only flow sent its request and waits for the answer: however long that takes, it is not a
+	// keep-alive, so the new flow waits its flowWait and is reset instead
+	h := newCapHandler(1, 150*time.Millisecond, 20*time.Millisecond, &keepAliveDispatcher{answer: false})
+	waiting := newBlockingConn()
+	go h.HandleConnection(waiting, capDest)
+	waitForFlows(h, 1)
 	time.Sleep(30 * time.Millisecond)
 
 	started := time.Now()
-	h.HandleConnection(newTestConn([]byte("hello")), dest)
+	h.HandleConnection(newBlockingConnClosingItself(), capDest)
+	if took := time.Since(started); took < h.flowWait {
+		t.Fatalf("the new flow got a slot after %v although the only flow waits for its answer", took)
+	}
+	if waiting.isClosed() {
+		t.Fatal("a flow waiting for its answer was closed for a slot")
+	}
+	waiting.Close()
+}
+
+func TestHandlerKeepsBusyFlowsAndResetsTheNewOne(t *testing.T) {
+	h := newCapHandler(1, 150*time.Millisecond, time.Hour, &keepAliveDispatcher{answer: true})
+	busy := newBlockingConn()
+	done := make(chan struct{})
+	go func() {
+		h.HandleConnection(busy, capDest)
+		close(done)
+	}()
+	waitForFlows(h, 1)
+	time.Sleep(30 * time.Millisecond)
+
+	started := time.Now()
+	h.HandleConnection(newBlockingConnClosingItself(), capDest)
 	if took := time.Since(started); took < h.flowWait {
 		t.Fatalf("the new flow got a slot after %v although the only flow was not idle enough", took)
 	}
-	select {
-	case <-busy.closed:
+	if busy.isClosed() {
 		t.Fatal("a flow below the idle threshold was closed")
-	default:
 	}
 	busy.Close()
+	<-done
 }

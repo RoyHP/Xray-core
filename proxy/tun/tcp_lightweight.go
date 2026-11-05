@@ -1246,11 +1246,32 @@ func (c *tcpConn) Close() error {
 		return nil
 	}
 	c.readable.Broadcast()
+	if c.sndFin {
+		// CloseWrite sent the FIN already; the connection ends when the system's comes (see input)
+		c.arm(tcpTick)
+		return nil
+	}
 	c.send(c.sndNxt, tcpFin|tcpAck, nil, nil)
 	c.sndFin = true
 	c.sndNxt++
 	c.arm(tcpTick)
 	return nil
+}
+
+// Quiet says whether nothing of the connection is in flight: the system sent nothing that waits to be
+// read, nothing is being written to it or waits for its window, and it acknowledged everything. A
+// keep-alive the application holds for later is so; a flow in the middle of a request is not
+func (c *tcpConn) Quiet() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err == nil && c.rcvLen == 0 && c.writing == 0 && !c.blocked && c.sndUna == c.sndNxt
+}
+
+// Alive says whether the connection is still there for the system
+func (c *tcpConn) Alive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err == nil && !c.closed
 }
 
 // CloseWrite sends the FIN of this side and keeps reading: what the other side of the proxied connection

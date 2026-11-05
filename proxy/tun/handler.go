@@ -36,9 +36,13 @@ type Handler struct {
 	flowWait time.Duration
 	// idleEvict is how long a dispatched flow must have carried nothing to be closed for a slot
 	idleEvict time.Duration
-	// flows are the dispatched TCP flows of the cap
+	// flows are the dispatched TCP flows of the cap; waiters counts the flows waiting for a slot and
+	// closingPending the flows closed for one whose slot is not free yet, so no more are closed than
+	// are waited for (the dispatch of a closed flow ends a moment after its reader does)
 	flowsMu         sync.Mutex
 	flows           map[*tcpFlow]struct{}
+	waiters         int
+	closingPending  int
 	stack           Stack
 	tun             Tun
 	policyManager   policy.Manager
@@ -75,12 +79,27 @@ type tcpFlow struct {
 	dest net.Destination
 	// last is the time of the last byte, in nanoseconds since the Unix epoch
 	last atomic.Int64
+	// down is set while the last byte went to the system, cleared when the system sent one: only a
+	// flow whose last word was an answer is a keep-alive the application holds for later; one that
+	// sent a request and waits for the answer is not, however long that takes
+	down atomic.Bool
 	// closing is set once the flow is closed for its slot, so it is not chosen again
 	closing atomic.Bool
 }
 
-func (f *tcpFlow) touch() {
+func (f *tcpFlow) touch(down bool) {
 	f.last.Store(time.Now().UnixNano())
+	f.down.Store(down)
+}
+
+// quietConn is a connection of the stack that can say whether nothing of it is in flight
+type quietConn interface {
+	Quiet() bool
+}
+
+// liveConn is a connection of the stack that can say whether the system still has it
+type liveConn interface {
+	Alive() bool
 }
 
 // activityReader stamps the flow when the system sends
@@ -92,7 +111,7 @@ type activityReader struct {
 func (r *activityReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := r.Reader.ReadMultiBuffer()
 	if !mb.IsEmpty() {
-		r.flow.touch()
+		r.flow.touch(false)
 	}
 	return mb, err
 }
@@ -128,7 +147,7 @@ func (w *TCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		w.Counter.Add(int64(size))
 	}
 	if w.Flow != nil && size > 0 {
-		w.Flow.touch()
+		w.Flow.touch(true)
 	}
 	return nil
 }
@@ -289,18 +308,21 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	// to its resolver must not queue behind a page's worth of busy flows.
 	var flow *tcpFlow
 	if t.tcpSlots != nil && destination.Network == net.Network_TCP && destination.Port != 53 {
-		if !t.acquireSlot(ctx, destination) {
+		if !t.acquireSlot(ctx, conn, destination) {
 			return
 		}
 		defer func() { <-t.tcpSlots }()
 		flow = &tcpFlow{conn: conn, dest: destination}
-		flow.touch()
+		flow.touch(false)
 		t.flowsMu.Lock()
 		t.flows[flow] = struct{}{}
 		t.flowsMu.Unlock()
 		defer func() {
 			t.flowsMu.Lock()
 			delete(t.flows, flow)
+			if flow.closing.Load() {
+				t.closingPending--
+			}
 			t.flowsMu.Unlock()
 		}()
 	}
@@ -353,25 +375,38 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 // acquireSlot takes a slot of the cap for a new flow. The system's side is established and its data waits
 // in the stack's window meanwhile. When no slot is free, the dispatched flow that has carried nothing for
-// the longest is closed for its slot, if that is idleEvict or more: a keep-alive the application holds for
-// later, which it opens again when it needs it, while a page's worth of them would otherwise sit in every
-// slot for as long as the servers keep them. A flow that still gets no slot within flowWait is reset so the
-// application retries instead of hanging.
-func (t *Handler) acquireSlot(ctx context.Context, destination net.Destination) bool {
+// the longest is closed for its slot, if that is idleEvict or more and it is a keep-alive: quiet, with an
+// answer as its last word, which the application holds for later and opens again when it needs it. A
+// page's worth of them would otherwise sit in every slot for as long as the servers keep them. No more
+// flows are closed than are waiting, since a closed flow's slot frees a moment after it is closed. A flow
+// that still gets no slot within flowWait is reset so the application retries instead of hanging.
+func (t *Handler) acquireSlot(ctx context.Context, conn net.Conn, destination net.Destination) bool {
 	select {
 	case t.tcpSlots <- struct{}{}:
 		return true
 	default:
 	}
+	t.flowsMu.Lock()
+	t.waiters++
+	t.flowsMu.Unlock()
+	defer func() {
+		t.flowsMu.Lock()
+		t.waiters--
+		t.flowsMu.Unlock()
+	}()
 	deadline := time.Now().Add(t.flowWait)
 	evicted := 0
 	for {
-		if t.evictIdle(ctx) {
-			evicted++
+		if l, ok := conn.(liveConn); ok && !l.Alive() {
+			// the system gave up on this one while it waited
+			return false
 		}
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			break
+		}
+		if t.evictIdle(ctx) {
+			evicted++
 		}
 		if wait > time.Second {
 			wait = time.Second
@@ -391,29 +426,48 @@ func (t *Handler) acquireSlot(ctx context.Context, destination net.Destination) 
 	return false
 }
 
-// evictIdle closes the dispatched flow that has carried nothing for the longest, if that is idleEvict or
-// more, and says whether it did. Its slot frees when its dispatch ends on the closed connection.
+// evictIdle closes the keep-alive that has carried nothing for the longest, if that is idleEvict or more
+// and fewer flows are closing than waiting, and says whether it did. Its slot frees when its dispatch ends
+// on the closed connection.
 func (t *Handler) evictIdle(ctx context.Context) bool {
 	if t.idleEvict <= 0 {
 		return false
 	}
 	now := time.Now().UnixNano()
+	t.flowsMu.Lock()
+	if t.closingPending >= t.waiters {
+		t.flowsMu.Unlock()
+		return false
+	}
+	candidates := make([]*tcpFlow, 0, len(t.flows))
+	for f := range t.flows {
+		if f.closing.Load() || !f.down.Load() || now-f.last.Load() < int64(t.idleEvict) {
+			continue
+		}
+		candidates = append(candidates, f)
+	}
+	t.flowsMu.Unlock()
+	// whether a candidate is quiet is asked of its connection, outside the lock
 	var oldest *tcpFlow
 	var oldestLast int64
-	t.flowsMu.Lock()
-	for f := range t.flows {
-		if f.closing.Load() {
+	for _, f := range candidates {
+		if q, ok := f.conn.(quietConn); ok && !q.Quiet() {
 			continue
 		}
 		if last := f.last.Load(); oldest == nil || last < oldestLast {
 			oldest, oldestLast = f, last
 		}
 	}
-	if oldest == nil || now-oldestLast < int64(t.idleEvict) {
+	if oldest == nil {
+		return false
+	}
+	t.flowsMu.Lock()
+	if _, there := t.flows[oldest]; !there || oldest.closing.Load() || t.closingPending >= t.waiters {
 		t.flowsMu.Unlock()
 		return false
 	}
 	oldest.closing.Store(true)
+	t.closingPending++
 	t.flowsMu.Unlock()
 	errors.LogWarning(ctx, "closing the flow to ", oldest.dest, " idle for ", time.Duration(now-oldestLast).Round(time.Second), " for a slot")
 	_ = oldest.conn.Close()
