@@ -31,7 +31,8 @@ const (
 	// TunMaxTCPFlowsKey caps how many TCP connections of a tun are dispatched at once; the rest wait,
 	// established, for a slot (and are reset after TunFlowWaitKey seconds). Every dispatched flow of a
 	// VLESS+Vision client is its own TLS session on the way out, ~180 KiB, which an iOS packet tunnel
-	// (50 MiB) cannot afford a hundred of. Port 53 is exempt (health probes to the resolver).
+	// (50 MiB) cannot afford a hundred of. Ports 53 (health probes to the resolver) and 5223 (Apple push,
+	// one long-lived connection per device) are exempt.
 	TunMaxTCPFlowsKey = "xray.tun.tcp.maxflows"
 	TunFlowWaitKey    = "xray.tun.tcp.flowwait"
 	// TunIdleEvictKey: when every slot of the cap is taken, the dispatched flow that has carried nothing

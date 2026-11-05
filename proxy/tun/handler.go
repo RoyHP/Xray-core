@@ -304,10 +304,12 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
 
-	// Port 53 is never capped: DNS over TCP is rare and tiny, and a client's health probe
-	// to its resolver must not queue behind a page's worth of busy flows.
+	// Ports 53 and 5223 are never capped. DNS over TCP is rare and tiny, and a client's health probe
+	// to its resolver must not queue behind a page's worth of busy flows. 5223 is Apple's push service:
+	// one long-lived, nearly silent connection per device that must neither hold a slot nor be closed
+	// for one (closing it delays every notification until the system reconnects).
 	var flow *tcpFlow
-	if t.tcpSlots != nil && destination.Network == net.Network_TCP && destination.Port != 53 {
+	if t.tcpSlots != nil && destination.Network == net.Network_TCP && !uncappedPort(destination.Port) {
 		if !t.acquireSlot(ctx, conn, destination) {
 			return
 		}
@@ -371,6 +373,11 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))
 	}
+}
+
+// uncappedPort reports whether flows to port bypass the cap
+func uncappedPort(port net.Port) bool {
+	return port == 53 || port == 5223
 }
 
 // acquireSlot takes a slot of the cap for a new flow. The system's side is established and its data waits
