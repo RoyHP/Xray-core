@@ -66,6 +66,24 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
+// closeAll ends every UDP flow: their readers get EOF, so the dispatch of
+// each one returns and lets go of its outbound (an XUDP mux session and,
+// with it, the mux worker's connection). Called when the stack closes;
+// without it an inbound's UDP flows, and the connections carrying them,
+// outlive the instance.
+func (u *udpConnectionHandler) closeAll() {
+	u.Lock()
+	conns := make([]*udpConn, 0, len(u.udpConns))
+	for _, c := range u.udpConns {
+		conns = append(conns, c)
+	}
+	u.udpConns = make(map[net.Destination]*udpConn)
+	u.Unlock()
+	for _, c := range conns {
+		c.queue.close()
+	}
+}
+
 func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	u.Lock()
 	// Close runs twice per flow; a newer conn may already own this src.

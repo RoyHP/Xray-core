@@ -29,7 +29,11 @@ import (
 
 // Handler is managing object that tie together tun interface, ip stack and dispatch connections to the routing
 type Handler struct {
-	ctx    context.Context
+	ctx context.Context
+	// cancel ends ctx, and with it every dispatch started from it, when the
+	// handler closes: ctx is detached from the instance's, so nothing else
+	// would.
+	cancel context.CancelFunc
 	config *Config
 	// tcpSlots bounds concurrently dispatched TCP flows when xray.tun.tcp.maxflows is set
 	tcpSlots chan struct{}
@@ -173,7 +177,7 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 		t.sniffingRequest = content.SniffingRequest
 	}
 
-	t.ctx = core.ToBackgroundDetachedContext(ctx)
+	t.ctx, t.cancel = context.WithCancel(core.ToBackgroundDetachedContext(ctx))
 	t.policyManager = pm
 	t.dispatcher = dispatcher
 	if n := platform.NewEnvFlag(platform.TunMaxTCPFlowsKey).GetValueAsInt(0); n > 0 {
@@ -483,6 +487,11 @@ func (t *Handler) evictIdle(ctx context.Context) bool {
 
 // Close implements common.Closable.
 func (t *Handler) Close() error {
+	// Cancel first so every in-flight dispatch unwinds, then close the stack
+	// (resets TCP, ends UDP flows) and the tun.
+	if t.cancel != nil {
+		t.cancel()
+	}
 	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
 }
 
