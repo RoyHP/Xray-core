@@ -90,9 +90,9 @@ func TestPacketQueueDropsDrainedStorage(t *testing.T) {
 	}
 }
 
-// A closing stack must end its UDP flows: the dispatch reading a flow gets
-// EOF and returns, instead of waiting on the queue forever and keeping its
-// outbound alive past the instance.
+// A closing stack must end its UDP flows: the dispatch reading a flow gets EOF and returns, instead of
+// waiting on the queue forever and keeping its outbound alive past the instance; a packet that arrives
+// afterwards opens no flow.
 func TestUDPHandlerCloseAllEndsFlows(t *testing.T) {
 	done := make(chan struct{}, 2)
 	handler := newUdpConnectionHandler(func(conn net.Conn, dest net.Destination) {
@@ -109,7 +109,6 @@ func TestUDPHandlerCloseAllEndsFlows(t *testing.T) {
 		src := net.UDPDestination(net.IPAddress([]byte{10, 255, 0, 2}), port)
 		handler.HandlePacket(src, dst, buf.FromBytes([]byte("query")))
 	}
-	time.Sleep(50 * time.Millisecond)
 	handler.closeAll()
 	for i := 0; i < 2; i++ {
 		select {
@@ -118,10 +117,11 @@ func TestUDPHandlerCloseAllEndsFlows(t *testing.T) {
 			t.Fatalf("flow %d still running after closeAll", i)
 		}
 	}
+	handler.HandlePacket(net.UDPDestination(net.IPAddress([]byte{10, 255, 0, 2}), 40002), dst, buf.FromBytes([]byte("late")))
 	handler.RLock()
 	n := len(handler.udpConns)
 	handler.RUnlock()
 	if n != 0 {
-		t.Fatalf("%d flows left in the table", n)
+		t.Fatalf("%d flows in the table after closeAll", n)
 	}
 }

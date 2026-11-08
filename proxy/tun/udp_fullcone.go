@@ -16,6 +16,8 @@ type udpConnectionHandler struct {
 	sync.RWMutex
 
 	udpConns map[net.Destination]*udpConn
+	// closed is set by closeAll; a packet that arrives after it opens no flow
+	closed bool
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -51,6 +53,10 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	u.Lock()
 	defer u.Unlock()
 
+	if u.closed {
+		data.Release()
+		return
+	}
 	conn, found = u.udpConns[src]
 	if !found {
 		conn = &udpConn{handler: u, queue: newPacketQueue(udpQueueLimit), src: src, dst: dst}
@@ -66,13 +72,12 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
-// closeAll ends every UDP flow: their readers get EOF, so the dispatch of
-// each one returns and lets go of its outbound (an XUDP mux session and,
-// with it, the mux worker's connection). Called when the stack closes;
-// without it an inbound's UDP flows, and the connections carrying them,
-// outlive the instance.
+// closeAll ends every UDP flow and takes no new ones: the readers get EOF, so the dispatch of each flow
+// returns and lets go of its outbound. Called when the stack closes; without it an inbound's UDP flows,
+// and whatever carries them, outlive the instance.
 func (u *udpConnectionHandler) closeAll() {
 	u.Lock()
+	u.closed = true
 	conns := make([]*udpConn, 0, len(u.udpConns))
 	for _, c := range u.udpConns {
 		conns = append(conns, c)
